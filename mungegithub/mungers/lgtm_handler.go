@@ -29,6 +29,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const (
+	approveLabel   = "approved"
+	approveCommand = "/approve"
+)
+
 // LGTMHandler will
 // - apply LGTM label if reviewer has commented "/lgtm", or
 // - remove LGTM label if reviewer has commented "/lgtm cancel"
@@ -85,8 +90,11 @@ func (h LGTMHandler) Munge(obj *github.MungeObject) {
 }
 
 func (h *LGTMHandler) addLGTMIfCommented(obj *github.MungeObject, comments []*githubapi.IssueComment, events []*githubapi.IssueEvent, reviewers mungerutil.UserSet) {
-	// Get the last time when the someone applied lgtm manually.
-	removeLGTMTime := e.LastEvent(events, e.And{e.RemoveLabel{}, e.LabelName(lgtmLabel), e.HumanActor()}, nil)
+	// match either `approved` or `lgtm`
+	approveOrLGTM := e.Or{e.LabelName(lgtmLabel), e.LabelName(approveLabel)}
+
+	// Get the last time when the someone applied lgtm or approve manually.
+	removeCommitAutoMergableTime := e.LastEvent(events, e.And{e.RemoveLabel{}, approveOrLGTM, e.HumanActor()}, nil)
 
 	// Assumption: The comments should be sorted (by default from github api) from oldest to latest
 	for i := len(comments) - 1; i >= 0; i-- {
@@ -113,14 +121,14 @@ func (h *LGTMHandler) addLGTMIfCommented(obj *github.MungeObject, comments []*gi
 
 		// check if someone manually removed the lgtm label after the `/lgtm` comment
 		// and honor it.
-		if removeLGTMTime != nil && removeLGTMTime.After(*comment.CreatedAt) {
+		if removeCommitAutoMergableTime != nil && removeCommitAutoMergableTime.After(*comment.CreatedAt) {
 			return
 		}
 
 		// TODO: support more complex policies for multiple reviewers.
 		// See https://github.com/kubernetes/contrib/issues/1389#issuecomment-235161164
-		glog.Infof("Adding lgtm label. Reviewer (%s) LGTM", *comment.User.Login)
-		obj.AddLabel(lgtmLabel)
+		glog.Infof("Adding lgtm and approve label. Reviewer (%s) LGTM|approve", *comment.User.Login)
+		obj.AddLabels([]string{lgtmLabel, approveLabel})
 		return
 	}
 }
