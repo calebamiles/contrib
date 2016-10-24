@@ -17,21 +17,13 @@ limitations under the License.
 package mungers
 
 import (
-	"strings"
-
 	"k8s.io/contrib/mungegithub/features"
 	"k8s.io/contrib/mungegithub/github"
-	e "k8s.io/contrib/mungegithub/mungers/matchers/event"
 	"k8s.io/contrib/mungegithub/mungers/mungerutil"
 
 	"github.com/golang/glog"
 	githubapi "github.com/google/go-github/github"
 	"github.com/spf13/cobra"
-)
-
-const (
-	approveLabel   = "approved"
-	approveCommand = "/approve"
 )
 
 // LGTMHandler will
@@ -90,11 +82,6 @@ func (h LGTMHandler) Munge(obj *github.MungeObject) {
 }
 
 func (h *LGTMHandler) addLGTMIfCommented(obj *github.MungeObject, comments []*githubapi.IssueComment, events []*githubapi.IssueEvent, reviewers mungerutil.UserSet) {
-	// match either `approved` or `lgtm`
-	approveOrLGTM := e.Or{e.LabelName(lgtmLabel), e.LabelName(approveLabel)}
-
-	// Get the last time when the someone applied lgtm or approve manually.
-	removeCommitAutoMergableTime := e.LastEvent(events, e.And{e.RemoveLabel{}, approveOrLGTM, e.HumanActor()}, nil)
 
 	// Assumption: The comments should be sorted (by default from github api) from oldest to latest
 	for i := len(comments) - 1; i >= 0; i-- {
@@ -103,25 +90,24 @@ func (h *LGTMHandler) addLGTMIfCommented(obj *github.MungeObject, comments []*gi
 			continue
 		}
 
-		// TODO: An approver should be acceptable.
-		// See https://github.com/kubernetes/contrib/pull/1428#discussion_r72563935
-		if !mungerutil.IsMungeBot(comment.User) && !isReviewer(comment.User, reviewers) {
+		if !isApprovedToAlterLabels(comment.User, reviewers) {
 			continue
 		}
 
 		fields := getFields(*comment.Body)
 		if isCancelComment(fields) {
-			// "/lgtm cancel" if commented more recently than "/lgtm"
+			// "/lgtm|approved cancel" if commented more recently than "/lgtm"
 			return
 		}
 
-		if !isLGTMComment(fields) {
+		if !isMergeComment(fields) {
 			continue
 		}
 
-		// check if someone manually removed the lgtm label after the `/lgtm` comment
+		// check if someone manually removed a mergable after the `/<mergableCommand>` comment
 		// and honor it.
-		if removeCommitAutoMergableTime != nil && removeCommitAutoMergableTime.After(*comment.CreatedAt) {
+		removeMerableLabelTime := manuallyRemoveMerableLabelTime(events) // Get the last time when the someone applied lgtm or approve manually.
+		if removeMerableLabelTime != nil && removeMerableLabelTime.After(*comment.CreatedAt) {
 			return
 		}
 
@@ -134,20 +120,18 @@ func (h *LGTMHandler) addLGTMIfCommented(obj *github.MungeObject, comments []*gi
 }
 
 func (h *LGTMHandler) removeLGTMIfCancelled(obj *github.MungeObject, comments []*githubapi.IssueComment, events []*githubapi.IssueEvent, reviewers mungerutil.UserSet) {
-	// Get time when the last (unlabeled, lgtm) event occurred.
-	addLGTMTime := e.LastEvent(events, e.And{e.AddLabel{}, e.LabelName(lgtmLabel), e.HumanActor()}, nil)
 	for i := len(comments) - 1; i >= 0; i-- {
 		comment := comments[i]
 		if !mungerutil.IsValidUser(comment.User) {
 			continue
 		}
 
-		if !mungerutil.IsMungeBot(comment.User) && !isReviewer(comment.User, reviewers) {
+		if !isApprovedToAlterLabels(comment.User, reviewers) {
 			continue
 		}
 
 		fields := getFields(*comment.Body)
-		if isLGTMComment(fields) {
+		if isMergeComment(fields) {
 			// "/lgtm" if commented more recently than "/lgtm cancel"
 			return
 		}
@@ -158,52 +142,13 @@ func (h *LGTMHandler) removeLGTMIfCancelled(obj *github.MungeObject, comments []
 
 		// check if someone manually added the lgtm label after the `/lgtm cancel` comment
 		// and honor it.
+		addLGTMTime := manuallyAddMergableLabelTime(events) // Get time when the last (unlabeled, mergableCommand) event occurred.
 		if addLGTMTime != nil && addLGTMTime.After(*comment.CreatedAt) {
 			return
 		}
 
 		glog.Infof("Removing lgtm label. Reviewer (%s) cancelled", *comment.User.Login)
-		obj.RemoveLabel(lgtmLabel)
+		obj.RemoveLabel(lgtmLabel) //TODO create RemoveLabels() to remove multiple labels
 		return
 	}
-}
-
-func isLGTMComment(fields []string) bool {
-	// Note: later we'd probably move all the bot-command parsing code to its own package.
-	return len(fields) == 1 && strings.ToLower(fields[0]) == "/lgtm"
-}
-
-func isCancelComment(fields []string) bool {
-	return len(fields) == 2 && strings.ToLower(fields[0]) == "/lgtm" && strings.ToLower(fields[1]) == "cancel"
-}
-
-func getReviewers(obj *github.MungeObject) mungerutil.UserSet {
-	// Note: assuming assignees are reviewers
-	allAssignees := append(obj.Issue.Assignees, obj.Issue.Assignee)
-	return mungerutil.GetUsers(allAssignees...)
-}
-
-func getCommentsAfterLastModified(obj *github.MungeObject) ([]*githubapi.IssueComment, error) {
-	afterLastModified := func(opt *githubapi.IssueListCommentsOptions) *githubapi.IssueListCommentsOptions {
-		// Only comments updated at or after this time are returned.
-		// One possible case is that reviewer might "/lgtm" first, contributor updated PR, and reviewer updated "/lgtm".
-		// This is still valid. We don't recommend user to update it.
-		lastModified := *obj.LastModifiedTime()
-		opt.Since = lastModified
-		return opt
-	}
-	return obj.ListComments(afterLastModified)
-}
-
-func isReviewer(user *githubapi.User, reviewers mungerutil.UserSet) bool {
-	return reviewers.Has(user)
-}
-
-// getFields will move to a different package where we do command
-// parsing in the near future.
-func getFields(commentBody string) []string {
-	// remove the comment portion if present and read the command.
-	cmd := strings.Split(commentBody, "//")[0]
-	strings.TrimSpace(cmd)
-	return strings.Fields(cmd)
 }

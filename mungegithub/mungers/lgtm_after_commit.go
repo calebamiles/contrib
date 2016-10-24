@@ -75,15 +75,15 @@ func (LGTMAfterCommitMunger) Munge(obj *github.MungeObject) {
 	}
 
 	lastModified := obj.LastModifiedTime()
-	lgtmTime := obj.LabelTime(lgtmLabel)
+	mergableLabelAddedTime := mergableLabelAddedTime(obj)
 
-	if lastModified == nil || lgtmTime == nil {
+	if lastModified == nil || mergableLabelAddedTime == nil {
 		glog.Errorf("PR %d unable to determine lastModified or lgtmTime", *obj.Issue.Number)
 		return
 	}
 
-	if lastModified.After(*lgtmTime) {
-		glog.Infof("PR: %d lgtm:%s  lastModified:%s", *obj.Issue.Number, lgtmTime.String(), lastModified.String())
+	if lastModified.After(*mergableLabelAddedTime) {
+		glog.Infof("PR: %d lgtm:%s  lastModified:%s", *obj.Issue.Number, mergableLabelAddedTime.String(), lastModified.String())
 		body := fmt.Sprintf(lgtmRemovedBody, mungerutil.GetIssueUsers(obj.Issue).AllUsers().Mention().Join())
 		if err := obj.WriteComment(body); err != nil {
 			return
